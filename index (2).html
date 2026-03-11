@@ -1,0 +1,1209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>USA Staffing Services — Agent Portal</title>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;600;700&family=Barlow+Condensed:wght@400;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #060e18; color: #cce4ff; font-family: 'Barlow', sans-serif; }
+    #root { min-height: 100vh; }
+    .spin { animation: spin 1s linear infinite; display: inline-block; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  </style>
+
+  <!-- React 18 -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel standalone (JSX in-browser) -->
+  <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
+
+  <!-- SheetJS (XLSX parsing) -->
+  <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <!-- Recharts -->
+  <script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+
+  <!-- Supabase -->
+  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useMemo, useEffect, useCallback } = React;
+    const RC = window.Recharts || {};
+    const BarChart = RC.BarChart, Bar = RC.Bar, XAxis = RC.XAxis, YAxis = RC.YAxis;
+    const CartesianGrid = RC.CartesianGrid, Tooltip = RC.Tooltip;
+    const ResponsiveContainer = RC.ResponsiveContainer;
+    const AreaChart = RC.AreaChart, Area = RC.Area, Legend = RC.Legend;
+
+    /* ─── SUPABASE ───────────────────────────────────────────────────────────── */
+    const SUPA_URL = "https://neycvsmpemzokfvdhufo.supabase.co";
+    const SUPA_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5leWN2c21wZW16b2tmdmRodWZvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMxODc5ODAsImV4cCI6MjA4ODc2Mzk4MH0.xBAiEqBkv6ZNLrTOQETx4FxZWizXtLNUnY-iWRJEsS8";
+    const supabase = window.supabase.createClient(SUPA_URL, SUPA_KEY);
+
+    /* ─── SUPABASE DATA LAYER ────────────────────────────────────────────────── */
+    async function dbLoadUploads() {
+      const { data, error } = await supabase.from("weekly_uploads").select("*").order("period_end", { ascending: true });
+      if (error) { console.error("Load uploads:", error); return []; }
+      return (data || []).map(row => ({
+        id: row.id,
+        periodEnd: row.period_end,
+        filename: row.filename,
+        uploadedAt: new Date(row.uploaded_at).toLocaleDateString(),
+        records: row.records,
+        recordCount: row.records.length,
+        agentCount: new Set(row.records.map(r => r.branch)).size,
+      }));
+    }
+
+    async function dbSaveUpload(periodEnd, filename, records) {
+      // Delete existing for same period first
+      await supabase.from("weekly_uploads").delete().eq("period_end", periodEnd);
+      const { data, error } = await supabase.from("weekly_uploads").insert({
+        period_end: periodEnd,
+        filename,
+        records,
+      }).select().single();
+      if (error) { console.error("Save upload:", error); return null; }
+      return data;
+    }
+
+    async function dbDeleteUpload(periodEnd) {
+      const { error } = await supabase.from("weekly_uploads").delete().eq("period_end", periodEnd);
+      if (error) console.error("Delete upload:", error);
+    }
+
+    async function dbLoadAgentProfiles() {
+      const { data, error } = await supabase.from("agent_profiles").select("*");
+      if (error) { console.error("Load agents:", error); return {}; }
+      const map = {};
+      (data || []).forEach(row => {
+        map[row.branch_name] = { password: row.password, email: row.email, phone: row.phone, notes: row.notes, enabled: row.enabled, addedAt: new Date(row.created_at).toLocaleDateString() };
+      });
+      return map;
+    }
+
+    async function dbSaveAgentProfile(branchName, profile) {
+      const { error } = await supabase.from("agent_profiles").upsert({
+        branch_name: branchName,
+        password: profile.password || "staffing123",
+        email: profile.email || null,
+        phone: profile.phone || null,
+        notes: profile.notes || null,
+        enabled: profile.enabled !== false,
+      }, { onConflict: "branch_name" });
+      if (error) console.error("Save agent:", error);
+    }
+
+    async function dbLoadInvoices() {
+      const { data, error } = await supabase.from("invoices").select("*").order("added_at", { ascending: true });
+      if (error) { console.error("Load invoices:", error); return []; }
+      return (data || []).map(row => ({
+        invoiceNum: row.invoice_num,
+        customer: row.customer,
+        branch: row.branch,
+        invoiceDate: row.invoice_date,
+        statementDate: row.statement_date,
+        invoiceAmount: row.invoice_amount,
+        balanceDue: row.balance_due,
+        manualStatus: row.manual_status,
+        manualProfit: row.manual_profit,
+        addedAt: row.added_at,
+      }));
+    }
+
+    async function dbSaveInvoice(inv) {
+      const { error } = await supabase.from("invoices").upsert({
+        invoice_num: inv.invoiceNum,
+        customer: inv.customer,
+        branch: inv.branch || null,
+        invoice_date: inv.invoiceDate || null,
+        statement_date: inv.statementDate || null,
+        invoice_amount: inv.invoiceAmount,
+        balance_due: inv.balanceDue,
+        manual_status: inv.manualStatus || null,
+        manual_profit: inv.manualProfit !== undefined ? inv.manualProfit : null,
+      }, { onConflict: "invoice_num" });
+      if (error) console.error("Save invoice:", error);
+    }
+
+    /* ─── XLSX PARSER ────────────────────────────────────────────────────────── */
+    function parseBullhornXLSX(buffer) {
+      const wb = XLSX.read(buffer, { type: "array", cellDates: true });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { raw: false, defval: "" });
+      const records = [];
+      for (const row of rows) {
+        const branch = (row["Branch"] || "").trim();
+        const candidate = (row["Candidate Name"] || "").trim();
+        if (!branch || !candidate) continue;
+        const periodRaw = row["Billing Period End Date"];
+        let periodDate = null;
+        if (periodRaw) { const d = new Date(periodRaw); if (!isNaN(d)) periodDate = d.toISOString().split("T")[0]; }
+        const p = (v) => parseFloat(String(v).replace(/[$,]/g,"")) || 0;
+        records.push({
+          branch, candidate,
+          customer: (row["Customer"] || "").trim(),
+          periodEnd: periodDate,
+          jobTitle: (row["Job Title"] || "").trim(),
+          payRate: p(row["Pay Rate_"]),
+          billRate: p(row["Bill Rate_"]),
+          regHoursBilled: p(row["Reg Hours Billed"]),
+          otHoursBilled: p(row["OT Hours Billed"]),
+          grossSales: p(row["Gross Sales Amount"]),
+          grossWages: p(row["Gross Wages Amount"]),
+          burdenAmt: p(row["Assignment Burden ($)"]),
+          agentProfit: p(row["Staffing Agent Profit"]),
+        });
+      }
+      return records;
+    }
+
+    function parseInvoiceXLSX(buffer) {
+      const wb = XLSX.read(buffer, { type: "array", cellDates: true });
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { raw: false, defval: "" });
+      const p = (v) => parseFloat(String(v).replace(/[$,]/g,"")) || 0;
+      const pd = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d) ? null : d.toISOString().split("T")[0]; };
+      return rows.map(row => {
+        const num = (row["Invoice #"] || row["Invoice Number"] || row["Invoice No"] || "").toString().trim();
+        if (!num) return null;
+        return {
+          invoiceNum: num,
+          customer: (row["Customer"] || row["Client"] || "").trim(),
+          branch: (row["Branch"] || row["Agent"] || "").trim(),
+          invoiceDate: pd(row["Invoice Date"] || row["Date"]),
+          statementDate: pd(row["Invoice Statement Date"] || row["Statement Date"]),
+          invoiceAmount: p(row["Amount"] || row["Invoice Amount"]),
+          balanceDue: p(row["Balance Due"] || row["Balance"]),
+        };
+      }).filter(Boolean);
+    }
+
+    /* ─── UTILITIES ──────────────────────────────────────────────────────────── */
+    const fmt  = (n) => "$" + (Number(n)||0).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+    const fmtK = (n) => "$" + ((Number(n)||0)/1000).toFixed(1) + "k";
+    const th   = (r) => (r.regHoursBilled||0) + (r.otHoursBilled||0);
+
+    function weekLabel(d) {
+      if (!d) return "—";
+      const dt = new Date(d + "T12:00:00");
+      return `WE ${(dt.getMonth()+1).toString().padStart(2,"0")}/${dt.getDate().toString().padStart(2,"0")}/${dt.getFullYear()}`;
+    }
+
+    function invStatus(inv) {
+      if (inv.manualStatus) return inv.manualStatus;
+      if (inv.balanceDue <= 0) return "Paid";
+      if (inv.balanceDue < inv.invoiceAmount) return "Partial";
+      return "Unpaid";
+    }
+
+    /* ─── SHARED UI ──────────────────────────────────────────────────────────── */
+    const StatCard = ({ label, value, sub, accent, icon }) => (
+      <div style={{ background:"#0f1923", border:`1px solid ${accent}33`, borderTop:`3px solid ${accent}`, borderRadius:8, padding:"16px 20px", flex:1, minWidth:140 }}>
+        <div style={{ fontSize:9, fontFamily:"'Barlow Condensed',sans-serif", letterSpacing:"0.12em", textTransform:"uppercase", color:"#7a8fa6", marginBottom:5 }}>{icon} {label}</div>
+        <div style={{ fontSize:24, fontWeight:800, fontFamily:"'Barlow Condensed',sans-serif", color:"#f0f6ff" }}>{value}</div>
+        {sub && <div style={{ fontSize:10, color:"#4a6680", marginTop:3 }}>{sub}</div>}
+      </div>
+    );
+
+    const CustomTooltip = ({ active, payload, label }) => {
+      if (!active || !payload?.length) return null;
+      return (
+        <div style={{ background:"#0a1a2a", border:"1px solid #1e3a55", borderRadius:8, padding:"10px 14px", fontSize:12 }}>
+          <div style={{ color:"#60a8d8", fontWeight:700, marginBottom:5 }}>{label}</div>
+          {payload.map(p => <div key={p.name} style={{ color:p.color, marginBottom:2 }}>{p.name}: <strong>{fmt(p.value)}</strong></div>)}
+        </div>
+      );
+    };
+
+    const Loader = ({ text }) => (
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:10, padding:"60px 0", color:"#4a6680", fontSize:13 }}>
+        <span className="spin">⟳</span> {text || "Loading…"}
+      </div>
+    );
+
+    /* ─── WORKER TABLE ───────────────────────────────────────────────────────── */
+    function WorkerTable({ records }) {
+      return (
+        <div style={{ overflowX:"auto" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+            <thead>
+              <tr style={{ background:"#0a1520" }}>
+                {["Worker","Customer","Title","Pay Rate","Bill Rate","Reg Hrs","OT Hrs","Total Hrs","Gross Sales","Gross Wages","Profit"].map(h => (
+                  <th key={h} style={{ padding:"9px 12px", textAlign:"left", color:"#4a8fb8", fontFamily:"'Barlow Condensed',sans-serif", fontSize:10, letterSpacing:"0.07em", textTransform:"uppercase", borderBottom:"1px solid #1a2d40", whiteSpace:"nowrap" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {records.map((r,i) => (
+                <tr key={i} style={{ background:i%2===0?"#0d1e2e":"#0f2133", borderBottom:"1px solid #142030" }}>
+                  <td style={{ padding:"9px 12px", color:"#cce4ff", fontWeight:600, whiteSpace:"nowrap" }}>{r.candidate}</td>
+                  <td style={{ padding:"9px 12px", color:"#8ab0cc", whiteSpace:"nowrap" }}>{r.customer}</td>
+                  <td style={{ padding:"9px 12px", color:"#6890a8", maxWidth:140, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{r.jobTitle}</td>
+                  <td style={{ padding:"9px 12px", color:"#f0c060", whiteSpace:"nowrap" }}>${r.payRate}/hr</td>
+                  <td style={{ padding:"9px 12px", color:"#d0a040", whiteSpace:"nowrap" }}>${r.billRate}/hr</td>
+                  <td style={{ padding:"9px 12px", color:"#8ab0cc" }}>{(r.regHoursBilled||0).toFixed(2)}</td>
+                  <td style={{ padding:"9px 12px", color:r.otHoursBilled>0?"#e09040":"#4a6680" }}>{(r.otHoursBilled||0).toFixed(2)}</td>
+                  <td style={{ padding:"9px 12px", color:"#a0c8e0", fontWeight:600 }}>{th(r).toFixed(2)}</td>
+                  <td style={{ padding:"9px 12px", color:"#60c8f8" }}>{fmt(r.grossSales)}</td>
+                  <td style={{ padding:"9px 12px", color:"#f0c060" }}>{fmt(r.grossWages)}</td>
+                  <td style={{ padding:"9px 12px", color:"#40e090", fontWeight:700 }}>{fmt(r.agentProfit)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    /* ─── UPLOAD PANEL ───────────────────────────────────────────────────────── */
+    function UploadPanel({ onUpload, onDelete, uploadHistory, saving }) {
+      const [dragging, setDragging] = useState(false);
+      const [status, setStatus]     = useState("");
+      const [confirmDel, setConfirmDel] = useState(null);
+
+      const processFile = useCallback((file) => {
+        if (!file) return;
+        setStatus("Parsing…");
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+          try {
+            const records = parseBullhornXLSX(new Uint8Array(e.target.result));
+            if (!records.length) { setStatus("⚠ No valid rows found. Check column headers."); return; }
+            const periodEnd = records.find(r => r.periodEnd)?.periodEnd;
+            if (!periodEnd) { setStatus("⚠ Could not determine billing period date."); return; }
+            setStatus("Saving to database…");
+            await onUpload(records, file.name, periodEnd);
+            setStatus(`✓ ${records.length} records saved · ${new Set(records.map(r=>r.branch)).size} agents · ${weekLabel(periodEnd)}`);
+          } catch (err) { setStatus("⚠ Error: " + err.message); }
+        };
+        reader.readAsArrayBuffer(file);
+      }, [onUpload]);
+
+      return (
+        <div style={{ padding:28 }}>
+          <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:18, fontWeight:700, color:"#cce4ff", marginBottom:4 }}>Upload Weekly BullhornONE Report</div>
+          <div style={{ fontSize:12, color:"#4a6680", marginBottom:20 }}>Data is saved to Supabase and shared with all users instantly.</div>
+
+          <div
+            onDragOver={e=>{e.preventDefault();setDragging(true);}}
+            onDragLeave={()=>setDragging(false)}
+            onDrop={e=>{e.preventDefault();setDragging(false);processFile(e.dataTransfer.files[0]);}}
+            onClick={()=>document.getElementById("xlsxUpload").click()}
+            style={{ border:`2px dashed ${dragging?"#4a8fb8":"#1e3a55"}`, borderRadius:12, padding:"44px 32px", textAlign:"center", cursor:"pointer", background:dragging?"#0e2035":"#0a1520", transition:"all 0.2s" }}>
+            <div style={{ fontSize:32, marginBottom:10 }}>📊</div>
+            <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:16, color:"#8ab0cc", marginBottom:5 }}>Drop SA_data_WE_*.xlsx here or click to browse</div>
+            <div style={{ fontSize:11, color:"#4a6680" }}>Columns: Branch, Candidate Name, Billing Period End Date, Gross Sales, Gross Wages, Staffing Agent Profit…</div>
+            <input id="xlsxUpload" type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>processFile(e.target.files[0])} />
+          </div>
+
+          {status && (
+            <div style={{ marginTop:14, padding:"11px 16px", borderRadius:8, background:status.startsWith("✓")?"#0a2a1a":"#2a1a0a", border:`1px solid ${status.startsWith("✓")?"#40e09040":"#e0a04040"}`, color:status.startsWith("✓")?"#40e090":"#e0a040", fontSize:13 }}>
+              {status}
+            </div>
+          )}
+
+          {uploadHistory.length > 0 && (
+            <div style={{ marginTop:28 }}>
+              <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:14, fontWeight:700, color:"#8ab0cc", marginBottom:12, letterSpacing:"0.06em", textTransform:"uppercase" }}>Upload History</div>
+              <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+                {uploadHistory.slice().reverse().map((h,i) => (
+                  <div key={i} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:8, padding:"12px 16px", flexWrap:"wrap", gap:8 }}>
+                    <div>
+                      <div style={{ fontSize:13, color:"#cce4ff", fontWeight:600 }}>{weekLabel(h.periodEnd)}</div>
+                      <div style={{ fontSize:11, color:"#4a6680", marginTop:2 }}>{h.filename} · {h.recordCount} records · {h.agentCount} agents · {h.uploadedAt}</div>
+                    </div>
+                    {confirmDel === h.periodEnd ? (
+                      <div style={{ display:"flex", gap:6 }}>
+                        <button onClick={async()=>{await onDelete(h.periodEnd);setConfirmDel(null);}} style={{ background:"#c8102e", color:"#fff", border:"none", borderRadius:5, padding:"4px 10px", fontSize:11, cursor:"pointer", fontWeight:700 }}>Confirm Delete</button>
+                        <button onClick={()=>setConfirmDel(null)} style={{ background:"#0a1520", border:"1px solid #1e3a55", color:"#4a6680", borderRadius:5, padding:"4px 8px", fontSize:11, cursor:"pointer" }}>Cancel</button>
+                      </div>
+                    ) : (
+                      <button onClick={()=>setConfirmDel(h.periodEnd)} style={{ background:"none", border:"1px solid #1e3a55", color:"#4a6680", borderRadius:5, padding:"4px 10px", fontSize:11, cursor:"pointer" }}>🗑 Remove</button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ─── INVOICE MANAGEMENT ─────────────────────────────────────────────────── */
+    function InvoiceTab({ invoices, allAgentNames, onUpload, onOverride }) {
+      const [drag, setDrag]     = useState(false);
+      const [status, setStatus] = useState("");
+      const [filter, setFilter] = useState("all");
+      const [editNum, setEditNum] = useState(null);
+      const [editForm, setEditForm] = useState({ status:"auto", profit:"" });
+
+      const filtered = invoices.filter(i => filter==="all" || i.status.toLowerCase()===filter);
+
+      const processFile = (file) => {
+        if (!file) return;
+        setStatus("Parsing…");
+        const fr = new FileReader();
+        fr.onload = async (e) => {
+          try {
+            const parsed = parseInvoiceXLSX(new Uint8Array(e.target.result));
+            if (!parsed.length) { setStatus("⚠ No valid rows found."); return; }
+            setStatus("Saving…");
+            await onUpload(parsed);
+            setStatus(`✓ ${parsed.length} invoices processed.`);
+          } catch(err) { setStatus("⚠ " + err.message); }
+        };
+        fr.readAsArrayBuffer(file);
+      };
+
+      const totals = {
+        pending: invoices.reduce((s,i)=>s+i.pendingProfit,0),
+        paid:    invoices.reduce((s,i)=>s+i.paidProfit,0),
+        balance: invoices.reduce((s,i)=>s+i.balanceDue,0),
+      };
+
+      return (
+        <div>
+          <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:18 }}>
+            {[["🧾 Total Invoices", invoices.length, "#4a8fb8"],["⏳ Pending Profit", fmt(totals.pending), "#f0c060"],["✅ Paid Profit", fmt(totals.paid), "#40e090"],["💳 Outstanding", fmt(totals.balance), "#e06060"]].map(([l,v,c])=>(
+              <div key={l} style={{ background:"#0f1923", border:`1px solid ${c}33`, borderTop:`3px solid ${c}`, borderRadius:8, padding:"14px 18px", flex:1, minWidth:130 }}>
+                <div style={{ fontSize:9, fontFamily:"'Barlow Condensed',sans-serif", letterSpacing:"0.1em", textTransform:"uppercase", color:"#7a8fa6", marginBottom:4 }}>{l}</div>
+                <div style={{ fontSize:22, fontWeight:800, fontFamily:"'Barlow Condensed',sans-serif", color:c }}>{v}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:20, marginBottom:16 }}>
+            <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:15, fontWeight:700, color:"#cce4ff", marginBottom:4 }}>Upload Invoice Report</div>
+            <div style={{ fontSize:11, color:"#4a6680", marginBottom:12 }}>Balance $0 = auto-marked Paid. Existing invoices get balance updated.</div>
+            <div onDragOver={e=>{e.preventDefault();setDrag(true);}} onDragLeave={()=>setDrag(false)}
+              onDrop={e=>{e.preventDefault();setDrag(false);processFile(e.dataTransfer.files[0]);}}
+              onClick={()=>document.getElementById("invUp").click()}
+              style={{ border:`2px dashed ${drag?"#4a8fb8":"#1e3a55"}`, borderRadius:8, padding:"28px 20px", textAlign:"center", cursor:"pointer", background:drag?"#0e2035":"#0a1520" }}>
+              <div style={{ fontSize:24, marginBottom:6 }}>📄</div>
+              <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:13, color:"#8ab0cc" }}>Drop invoice XLSX here or click to browse</div>
+              <input id="invUp" type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>processFile(e.target.files[0])} />
+            </div>
+            {status && <div style={{ marginTop:10, padding:"9px 14px", borderRadius:7, background:status.startsWith("✓")?"#0a2a1a":"#2a1a0a", color:status.startsWith("✓")?"#40e090":"#e0a040", fontSize:12, border:`1px solid ${status.startsWith("✓")?"#40e09040":"#e0a04040"}` }}>{status}</div>}
+          </div>
+
+          <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10 }}>
+            <div style={{ padding:"12px 16px", borderBottom:"1px solid #1a3050", display:"flex", gap:6, flexWrap:"wrap", alignItems:"center" }}>
+              <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:14, fontWeight:700, color:"#cce4ff", marginRight:6 }}>All Invoices</div>
+              {[["all","All"],["unpaid","Unpaid"],["partial","Partial"],["paid","Paid"]].map(([v,l])=>(
+                <button key={v} onClick={()=>setFilter(v)} style={{ background:filter===v?"#1e4a78":"none", color:filter===v?"#cce4ff":"#4a6680", border:`1px solid ${filter===v?"#4a8fb8":"#1e3a55"}`, borderRadius:20, padding:"3px 12px", fontSize:11, cursor:"pointer", fontWeight:600 }}>{l}</button>
+              ))}
+              <div style={{ marginLeft:"auto", fontSize:11, color:"#4a6680" }}>{filtered.length} invoice{filtered.length!==1?"s":""}</div>
+            </div>
+            {invoices.length===0 ? (
+              <div style={{ padding:"36px 24px", textAlign:"center", color:"#4a6680", fontSize:13 }}>No invoices yet. Upload an invoice report above.</div>
+            ) : (
+              <div style={{ overflowX:"auto" }}>
+                <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12, minWidth:860 }}>
+                  <thead>
+                    <tr style={{ background:"#0a1520" }}>
+                      {["Invoice #","Agent","Customer","Inv Date","Statement Date","Amount","Paid","Balance","Linked Profit","Status","Override"].map(h=>(
+                        <th key={h} style={{ padding:"9px 11px", textAlign:"left", color:"#4a8fb8", fontFamily:"'Barlow Condensed',sans-serif", fontSize:10, letterSpacing:"0.06em", textTransform:"uppercase", borderBottom:"1px solid #1a2d40", whiteSpace:"nowrap" }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map((inv,i) => {
+                      const isEd = editNum===inv.invoiceNum;
+                      return (
+                        <tr key={i} style={{ background:isEd?"#0e1f10":i%2===0?"#0d1e2e":"#0f2133", borderBottom:"1px solid #142030" }}>
+                          <td style={{ padding:"8px 11px", fontWeight:700, color:"#cce4ff" }}>#{inv.invoiceNum}</td>
+                          <td style={{ padding:"8px 11px", color:"#8ab0cc", whiteSpace:"nowrap", maxWidth:100, overflow:"hidden", textOverflow:"ellipsis" }}>{inv.branch||"—"}</td>
+                          <td style={{ padding:"8px 11px", color:"#8ab0cc", maxWidth:130, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{inv.customer}</td>
+                          <td style={{ padding:"8px 11px", color:"#6890a8", whiteSpace:"nowrap" }}>{inv.invoiceDate||"—"}</td>
+                          <td style={{ padding:"8px 11px", color:"#6890a8", whiteSpace:"nowrap" }}>{inv.statementDate||"—"}</td>
+                          <td style={{ padding:"8px 11px", color:"#60c8f8", fontWeight:600 }}>{fmt(inv.invoiceAmount)}</td>
+                          <td style={{ padding:"8px 11px", color:"#40e090", fontWeight:600 }}>{fmt(inv.paidAmount)}</td>
+                          <td style={{ padding:"8px 11px", color:inv.balanceDue>0?"#e06060":"#40e090", fontWeight:700 }}>{fmt(inv.balanceDue)}</td>
+                          <td style={{ padding:"8px 11px", fontWeight:700 }}>
+                            {isEd ? (
+                              <input type="number" value={editForm.profit} onChange={e=>setEditForm(p=>({...p,profit:e.target.value}))} placeholder="Auto"
+                                style={{ width:72, padding:"3px 6px", background:"#0a1520", border:"1px solid #4a8fb8", borderRadius:4, color:"#cce4ff", fontSize:11, outline:"none" }} />
+                            ) : (
+                              <span style={{ color:inv.status==="Paid"?"#40e090":"#f0c060" }}>
+                                {fmt(inv.linkedProfit)}
+                                {inv.manualProfit!==undefined&&<span style={{fontSize:9,color:"#e06060",marginLeft:3}}>M</span>}
+                                {!inv.profitMatched&&inv.linkedProfit===0&&<span style={{color:"#4a6680",marginLeft:3}}>?</span>}
+                              </span>
+                            )}
+                          </td>
+                          <td style={{ padding:"8px 11px" }}>
+                            {isEd ? (
+                              <select value={editForm.status} onChange={e=>setEditForm(p=>({...p,status:e.target.value}))}
+                                style={{ background:"#0a1520", border:"1px solid #4a8fb8", color:"#cce4ff", borderRadius:4, padding:"3px 6px", fontSize:11, outline:"none" }}>
+                                <option value="auto">Auto</option>
+                                <option value="Unpaid">Unpaid</option>
+                                <option value="Partial">Partial</option>
+                                <option value="Paid">Paid</option>
+                              </select>
+                            ) : (
+                              <span style={{ background:inv.status==="Paid"?"#0a2a1a":inv.status==="Partial"?"#2a1a00":"#2a0a0a", color:inv.status==="Paid"?"#40e090":inv.status==="Partial"?"#f0c060":"#e06060", border:`1px solid ${inv.status==="Paid"?"#40e09040":inv.status==="Partial"?"#f0c06040":"#e0606040"}`, borderRadius:20, padding:"2px 9px", fontSize:10, fontWeight:700 }}>{inv.status}</span>
+                            )}
+                          </td>
+                          <td style={{ padding:"8px 11px", whiteSpace:"nowrap" }}>
+                            {isEd ? (
+                              <div style={{ display:"flex", gap:5 }}>
+                                <button onClick={()=>{onOverride(inv.invoiceNum,editForm.status,editForm.profit!==""?parseFloat(editForm.profit):undefined);setEditNum(null);}} style={{ background:"#1e4a78", color:"#cce4ff", border:"none", borderRadius:4, padding:"3px 9px", fontSize:11, cursor:"pointer", fontWeight:700 }}>Save</button>
+                                <button onClick={()=>setEditNum(null)} style={{ background:"none", border:"1px solid #1e3a55", color:"#4a6680", borderRadius:4, padding:"3px 7px", fontSize:11, cursor:"pointer" }}>✕</button>
+                              </div>
+                            ) : (
+                              <button onClick={()=>{setEditNum(inv.invoiceNum);setEditForm({status:inv.manualStatus||"auto",profit:inv.manualProfit!==undefined?String(inv.manualProfit):"" });}}
+                                style={{ background:"none", border:"1px solid #1e3a55", color:"#4a6680", borderRadius:4, padding:"3px 9px", fontSize:11, cursor:"pointer" }}>✎ Edit</button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+          <div style={{ marginTop:8, fontSize:10, color:"#4a6680" }}>M = manual profit · ? = no payroll match found</div>
+        </div>
+      );
+    }
+
+    /* ─── AGENT MANAGEMENT ───────────────────────────────────────────────────── */
+    function AgentManagement({ allAgentNames, agentProfiles, onSave }) {
+      const [editing, setEditing] = useState(null);
+      const [form, setForm]       = useState({ name:"", password:"staffing123", email:"", phone:"", notes:"" });
+      const [saving, setSaving]   = useState(false);
+
+      const allNames = [...new Set([...allAgentNames, ...Object.keys(agentProfiles)])].sort();
+
+      const save = async () => {
+        const key = editing==="new" ? form.name.trim() : editing;
+        if (!key) return;
+        setSaving(true);
+        await onSave(key, { password:form.password, email:form.email, phone:form.phone, notes:form.notes, enabled:agentProfiles[key]?.enabled!==false });
+        setSaving(false);
+        setEditing(null);
+      };
+
+      const toggle = async (name) => {
+        const cur = agentProfiles[name]?.enabled !== false;
+        await onSave(name, { ...agentProfiles[name], enabled:!cur });
+      };
+
+      const resetPw = async (name) => {
+        await onSave(name, { ...agentProfiles[name], password:"staffing123" });
+      };
+
+      return (
+        <div>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:18 }}>
+            <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:20, fontWeight:700, color:"#cce4ff" }}>Agent Management</div>
+            <button onClick={()=>{setEditing("new");setForm({name:"",password:"staffing123",email:"",phone:"",notes:"" });}}
+              style={{ background:"#1e4a78", color:"#cce4ff", border:"1px solid #4a8fb8", borderRadius:8, padding:"8px 18px", fontSize:12, fontWeight:700, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", textTransform:"uppercase" }}>+ Add Agent</button>
+          </div>
+
+          {editing && (
+            <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:20, marginBottom:18 }}>
+              <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:15, fontWeight:700, color:"#cce4ff", marginBottom:14 }}>{editing==="new"?"Add New Agent":`Edit: ${editing}`}</div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+                {editing==="new" && (
+                  <div>
+                    <label style={{ display:"block", fontSize:10, fontWeight:700, color:"#4a6680", textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:5 }}>Agency Name *</label>
+                    <input value={form.name} onChange={e=>setForm(p=>({...p,name:e.target.value}))} style={{ width:"100%", background:"#0a1520", border:"1px solid #1e3a55", borderRadius:7, padding:"9px 11px", color:"#cce4ff", fontSize:12, outline:"none", boxSizing:"border-box" }} />
+                  </div>
+                )}
+                {[["Password","password"],["Email","email"],["Phone","phone"]].map(([l,k])=>(
+                  <div key={k}>
+                    <label style={{ display:"block", fontSize:10, fontWeight:700, color:"#4a6680", textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:5 }}>{l}</label>
+                    <input value={form[k]} onChange={e=>setForm(p=>({...p,[k]:e.target.value}))} style={{ width:"100%", background:"#0a1520", border:"1px solid #1e3a55", borderRadius:7, padding:"9px 11px", color:"#cce4ff", fontSize:12, outline:"none", boxSizing:"border-box" }} />
+                  </div>
+                ))}
+                <div style={{ gridColumn:"1 / -1" }}>
+                  <label style={{ display:"block", fontSize:10, fontWeight:700, color:"#4a6680", textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:5 }}>Notes</label>
+                  <input value={form.notes} onChange={e=>setForm(p=>({...p,notes:e.target.value}))} style={{ width:"100%", background:"#0a1520", border:"1px solid #1e3a55", borderRadius:7, padding:"9px 11px", color:"#cce4ff", fontSize:12, outline:"none", boxSizing:"border-box" }} />
+                </div>
+              </div>
+              <div style={{ display:"flex", gap:8, marginTop:14 }}>
+                <button onClick={save} disabled={saving} style={{ background:"#1e4a78", color:"#cce4ff", border:"1px solid #4a8fb8", borderRadius:8, padding:"8px 18px", fontSize:12, fontWeight:700, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", textTransform:"uppercase", opacity:saving?0.6:1 }}>{saving?"Saving…":"Save"}</button>
+                <button onClick={()=>setEditing(null)} style={{ background:"#0a1520", border:"1px solid #1e3a55", color:"#4a6680", borderRadius:8, padding:"8px 14px", fontSize:12, cursor:"pointer" }}>Cancel</button>
+              </div>
+            </div>
+          )}
+
+          <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12, minWidth:560 }}>
+              <thead>
+                <tr style={{ background:"#0a1520" }}>
+                  {["Agency Name","Email","Phone","Password","Status","Notes","Actions"].map(h=>(
+                    <th key={h} style={{ padding:"9px 12px", textAlign:"left", color:"#4a8fb8", fontFamily:"'Barlow Condensed',sans-serif", fontSize:10, letterSpacing:"0.07em", textTransform:"uppercase", borderBottom:"1px solid #1a2d40", whiteSpace:"nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {allNames.map((name,i)=>{
+                  const p = agentProfiles[name]||{};
+                  const enabled = p.enabled!==false;
+                  return (
+                    <tr key={name} style={{ background:i%2===0?"#0d1e2e":"#0f2133", borderBottom:"1px solid #142030", opacity:enabled?1:0.6 }}>
+                      <td style={{ padding:"9px 12px", color:"#cce4ff", fontWeight:600 }}>{name}{allAgentNames.includes(name)&&<span style={{fontSize:9,color:"#4a6680",marginLeft:5}}>BH</span>}</td>
+                      <td style={{ padding:"9px 12px", color:"#8ab0cc" }}>{p.email||"—"}</td>
+                      <td style={{ padding:"9px 12px", color:"#8ab0cc", whiteSpace:"nowrap" }}>{p.phone||"—"}</td>
+                      <td style={{ padding:"9px 12px", color:"#4a6680", fontFamily:"monospace" }}>{"•".repeat(Math.min((p.password||"staffing123").length,10))}</td>
+                      <td style={{ padding:"9px 12px" }}>
+                        <span onClick={()=>toggle(name)} style={{ background:enabled?"#0a2a1a":"#2a0a0a", color:enabled?"#40e090":"#e06060", border:`1px solid ${enabled?"#40e09040":"#e0606040"}`, borderRadius:20, padding:"2px 10px", fontSize:10, fontWeight:700, cursor:"pointer" }}>{enabled?"Active":"Disabled"}</span>
+                      </td>
+                      <td style={{ padding:"9px 12px", color:"#4a6680", maxWidth:140, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{p.notes||"—"}</td>
+                      <td style={{ padding:"9px 12px", whiteSpace:"nowrap" }}>
+                        <div style={{ display:"flex", gap:6 }}>
+                          <button onClick={()=>{setEditing(name);setForm({name,password:p.password||"staffing123",email:p.email||"",phone:p.phone||"",notes:p.notes||""});}} style={{ background:"none", border:"1px solid #1e3a55", color:"#4a8fb8", borderRadius:5, padding:"3px 8px", fontSize:10, cursor:"pointer" }}>✎ Edit</button>
+                          <button onClick={()=>resetPw(name)} style={{ background:"none", border:"1px solid #1e3a55", color:"#4a6680", borderRadius:5, padding:"3px 8px", fontSize:10, cursor:"pointer" }}>↺ PW</button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ marginTop:8, fontSize:11, color:"#4a6680" }}>Default password: <code style={{background:"#0a1520",padding:"1px 5px",borderRadius:4,color:"#8ab0cc"}}>staffing123</code> · BH = from BullhornONE</div>
+        </div>
+      );
+    }
+
+    /* ─── MAIN APP ───────────────────────────────────────────────────────────── */
+    function StaffingDashboard() {
+      const [loggedIn, setLoggedIn]       = useState(false);
+      const [currentAgent, setCurrentAgent] = useState(null);
+      const [loginInput, setLoginInput]   = useState({ id:"", pass:"" });
+      const [loginError, setLoginError]   = useState("");
+      const [loading, setLoading]         = useState(true);
+
+      const [allUploads, setAllUploads]     = useState([]);
+      const [agentProfiles, setAgentProfiles] = useState({});
+      const [invoices, setInvoices]         = useState([]);
+
+      const [activeTab, setActiveTab]     = useState("overview");
+      const [selectedWeek, setSelectedWeek] = useState(null);
+      const [agentFilter, setAgentFilter] = useState(null);
+
+      // Load all data from Supabase on mount
+      useEffect(() => {
+        async function loadAll() {
+          setLoading(true);
+          const [uploads, profiles, invs] = await Promise.all([
+            dbLoadUploads(),
+            dbLoadAgentProfiles(),
+            dbLoadInvoices(),
+          ]);
+          setAllUploads(uploads);
+          setAgentProfiles(profiles);
+          setInvoices(invs);
+          setLoading(false);
+        }
+        loadAll();
+      }, []);
+
+      const allWeeks    = useMemo(() => [...new Set(allUploads.map(u=>u.periodEnd))].sort(), [allUploads]);
+      const latestWeek  = allWeeks[allWeeks.length-1] || null;
+      const displayWeek = selectedWeek || latestWeek;
+
+      const currentWeekRecords = useMemo(() =>
+        allUploads.find(u=>u.periodEnd===displayWeek)?.records || [],
+      [allUploads, displayWeek]);
+
+      const allAgentNames = useMemo(() => {
+        const s = new Set();
+        allUploads.forEach(u => u.records.forEach(r => s.add(r.branch)));
+        return [...s].sort();
+      }, [allUploads]);
+
+      const agentRecords = useMemo(() =>
+        currentAgent ? currentWeekRecords.filter(r=>r.branch===currentAgent) : currentWeekRecords,
+      [currentWeekRecords, currentAgent]);
+
+      const displayRecords = agentFilter ? agentRecords.filter(r=>r.branch===agentFilter) : agentRecords;
+
+      const kpi = useMemo(() => ({
+        workers:    displayRecords.length,
+        revenue:    displayRecords.reduce((s,r)=>s+r.grossSales,0),
+        payroll:    displayRecords.reduce((s,r)=>s+r.grossWages,0),
+        profit:     displayRecords.reduce((s,r)=>s+r.agentProfit,0),
+        customers:  new Set(displayRecords.map(r=>r.customer)).size,
+        totalHours: displayRecords.reduce((s,r)=>s+th(r),0),
+      }), [displayRecords]);
+
+      const historicalData = useMemo(() => allWeeks.map(week => {
+        const recs = (allUploads.find(u=>u.periodEnd===week)?.records||[]).filter(r=>!currentAgent||r.branch===currentAgent);
+        return { period:weekLabel(week), revenue:recs.reduce((s,r)=>s+r.grossSales,0), payroll:recs.reduce((s,r)=>s+r.grossWages,0), profit:recs.reduce((s,r)=>s+r.agentProfit,0), workers:recs.length };
+      }), [allUploads, allWeeks, currentAgent]);
+
+      const customerBreakdown = useMemo(() => {
+        const map = {};
+        displayRecords.forEach(r => {
+          if (!map[r.customer]) map[r.customer] = { customer:r.customer, workers:[], revenue:0, payroll:0, burden:0, profit:0 };
+          map[r.customer].workers.push(r);
+          map[r.customer].revenue += r.grossSales;
+          map[r.customer].payroll += r.grossWages;
+          map[r.customer].burden  += r.burdenAmt || 0;
+          map[r.customer].profit  += r.agentProfit;
+        });
+        return Object.values(map).sort((a,b)=>b.revenue-a.revenue);
+      }, [displayRecords]);
+
+      // Agent summary — all agents, current week
+      const agentSummary = useMemo(() => {
+        const map = {};
+        currentWeekRecords.forEach(r => {
+          const b = r.branch;
+          if (!map[b]) map[b] = { branch:b, workers:new Set(), customers:new Set(), revenue:0, payroll:0, burden:0, profit:0, hours:0, records:[] };
+          map[b].workers.add(r.candidate||r.candidateName||"");
+          map[b].customers.add(r.customer);
+          map[b].revenue += r.grossSales;
+          map[b].payroll += r.grossWages;
+          map[b].burden  += r.burdenAmt || 0;
+          map[b].profit  += r.agentProfit;
+          map[b].hours   += th(r);
+          map[b].records.push(r);
+        });
+        return Object.values(map).sort((a,b)=>b.profit-a.profit).map(a=>({
+          ...a, workerCount:a.workers.size, customerCount:a.customers.size
+        }));
+      }, [currentWeekRecords]);
+
+      const workerProfitData = useMemo(() =>
+        displayRecords.slice().sort((a,b)=>b.agentProfit-a.agentProfit).slice(0,20)
+          .map(r=>({ name:(r.candidate||r.candidateName||"").split(" ").filter(Boolean).map((w,i,a)=>i===0||i===a.length-1?w:"").filter(Boolean).join(" "), profit:r.agentProfit })),
+      [displayRecords]);
+
+      // Invoice profit linkage
+      const profitByKey = useMemo(() => {
+        const map = {};
+        allUploads.forEach(u => (u.records||[]).forEach(r => {
+          const k1 = `${(r.branch||"").toLowerCase().trim()}||${(r.customer||"").toLowerCase().trim()}||${r.periodEnd}`;
+          const k2 = `${(r.customer||"").toLowerCase().trim()}||${r.periodEnd}`;
+          map[k1] = (map[k1]||0) + r.agentProfit;
+          map[k2] = (map[k2]||0) + r.agentProfit;
+        }));
+        return map;
+      }, [allUploads]);
+
+      const enrichedInvoices = useMemo(() => invoices.map(inv => {
+        let linked = null;
+        for (const period of [inv.statementDate, inv.invoiceDate].filter(Boolean)) {
+          const k1 = `${(inv.branch||"").toLowerCase().trim()}||${(inv.customer||"").toLowerCase().trim()}||${period}`;
+          const k2 = `${(inv.customer||"").toLowerCase().trim()}||${period}`;
+          if (profitByKey[k1]!==undefined) { linked=profitByKey[k1]; break; }
+          if (profitByKey[k2]!==undefined) { linked=profitByKey[k2]; break; }
+        }
+        const lp     = inv.manualProfit!==undefined ? inv.manualProfit : (linked||0);
+        const status = invStatus(inv);
+        return { ...inv, linkedProfit:lp, profitMatched:linked!==null, status, paidAmount:inv.invoiceAmount-inv.balanceDue, pendingProfit:status!=="Paid"?lp:0, paidProfit:status==="Paid"?lp:0 };
+      }), [invoices, profitByKey]);
+
+      const agentInvoices = useMemo(() =>
+        currentAgent ? enrichedInvoices.filter(inv=>inv.branch&&inv.branch.toLowerCase().replace(/\s+/g,"")===currentAgent.toLowerCase().replace(/\s+/g,"")) : enrichedInvoices,
+      [enrichedInvoices, currentAgent]);
+
+      const profitSummary = useMemo(() => {
+        const src = currentAgent ? agentInvoices : enrichedInvoices;
+        return { pendingProfit:src.reduce((s,i)=>s+i.pendingProfit,0), paidProfit:src.reduce((s,i)=>s+i.paidProfit,0), unpaidCount:src.filter(i=>i.status==="Unpaid").length, partialCount:src.filter(i=>i.status==="Partial").length, paidCount:src.filter(i=>i.status==="Paid").length };
+      }, [enrichedInvoices, agentInvoices, currentAgent]);
+
+      // Handlers
+      const handleUpload = useCallback(async (records, filename, periodEnd) => {
+        await dbSaveUpload(periodEnd, filename, records);
+        const uploads = await dbLoadUploads();
+        setAllUploads(uploads);
+        setSelectedWeek(periodEnd);
+        // Auto-register new agents
+        const newBranches = [...new Set(records.map(r=>r.branch))];
+        const profiles = { ...agentProfiles };
+        let changed = false;
+        for (const b of newBranches) {
+          if (!profiles[b]) { await dbSaveAgentProfile(b, { password:"staffing123", enabled:true }); changed=true; }
+        }
+        if (changed) { const p = await dbLoadAgentProfiles(); setAgentProfiles(p); }
+      }, [agentProfiles]);
+
+      const handleDelete = useCallback(async (periodEnd) => {
+        await dbDeleteUpload(periodEnd);
+        const uploads = await dbLoadUploads();
+        setAllUploads(uploads);
+        if (selectedWeek===periodEnd) {
+          const rem = uploads.map(u=>u.periodEnd).sort();
+          setSelectedWeek(rem[rem.length-1]||null);
+        }
+      }, [selectedWeek]);
+
+      const handleSaveAgent = useCallback(async (key, profile) => {
+        await dbSaveAgentProfile(key, profile);
+        const p = await dbLoadAgentProfiles();
+        setAgentProfiles(p);
+      }, []);
+
+      const handleInvoiceUpload = useCallback(async (parsed) => {
+        for (const inv of parsed) { await dbSaveInvoice(inv); }
+        const invs = await dbLoadInvoices();
+        setInvoices(invs);
+      }, []);
+
+      const handleInvoiceOverride = useCallback(async (invoiceNum, newStatus, manualProfit) => {
+        const inv = invoices.find(i=>i.invoiceNum===invoiceNum);
+        if (!inv) return;
+        const updated = { ...inv, manualStatus:newStatus==="auto"?null:newStatus };
+        if (manualProfit!==undefined) updated.manualProfit = manualProfit;
+        await dbSaveInvoice(updated);
+        const invs = await dbLoadInvoices();
+        setInvoices(invs);
+      }, [invoices]);
+
+      const handleLogin = () => {
+        if (loginInput.id.toUpperCase()==="ADMIN" && loginInput.pass==="uss2026!") {
+          setCurrentAgent(null); setLoggedIn(true); setLoginError(""); return;
+        }
+        const match = allAgentNames.find(n=>n.toLowerCase().replace(/\s+/g,"")===loginInput.id.toLowerCase().replace(/\s+/g,""));
+        if (!match) { setLoginError("Agent not found. Use your full agency name or contact Admin."); return; }
+        const profile = agentProfiles[match];
+        if (profile?.enabled===false) { setLoginError("This account has been disabled. Contact Admin."); return; }
+        if (loginInput.pass===(profile?.password||"staffing123")) { setCurrentAgent(match); setLoggedIn(true); setLoginError(""); }
+        else { setLoginError("Incorrect password. Please try again."); }
+      };
+
+      const uploadHistory = useMemo(() => allUploads.map(u=>({ periodEnd:u.periodEnd, filename:u.filename, recordCount:u.recordCount, agentCount:u.agentCount, uploadedAt:u.uploadedAt })), [allUploads]);
+
+      const tabs = currentAgent
+        ? [["overview","Overview"],["payments","Payments"],["workers","Workers"],["customers","Customers"],["analytics","Analytics"]]
+        : [["overview","Overview"],["agents","By Agent"],["workers","Workers"],["customers","Customers"],["analytics","Analytics"],["invoices","Invoices"],["manage","Agent Mgmt"],["upload","Upload Data"]];
+
+      /* ── LOADING SCREEN ── */
+      if (loading) {
+        return (
+          <div style={{ minHeight:"100vh", background:"#060e18", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16 }}>
+            <img src="https://www.usastaffingservices.com/wp-content/uploads/2022/11/USA-Staffing-Services.png"
+              alt="USS" style={{ height:44, filter:"brightness(0) invert(1)", objectFit:"contain" }} />
+            <div style={{ display:"flex", alignItems:"center", gap:10, color:"#4a6680", fontSize:13 }}>
+              <span className="spin">⟳</span> Connecting to database…
+            </div>
+          </div>
+        );
+      }
+
+      /* ── LOGIN ── */
+      if (!loggedIn) {
+        return (
+          <div style={{ minHeight:"100vh", background:"#060e18", display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}>
+            <div style={{ width:"100%", maxWidth:420 }}>
+              <div style={{ textAlign:"center", marginBottom:32 }}>
+                <img src="https://www.usastaffingservices.com/wp-content/uploads/2022/11/USA-Staffing-Services.png"
+                  alt="USS" style={{ height:52, filter:"brightness(0) invert(1)", objectFit:"contain" }}
+                  onError={e=>{e.target.style.display="none";}} />
+                <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:13, color:"#4a8fb8", letterSpacing:"0.1em", textTransform:"uppercase", marginTop:12 }}>Staffing Agent Portal</div>
+              </div>
+              <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:12, padding:32 }}>
+                <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:22, fontWeight:800, color:"#cce4ff", marginBottom:4 }}>Welcome back</div>
+                <div style={{ fontSize:12, color:"#4a6680", marginBottom:24 }}>Sign in to your agent dashboard</div>
+                {[["Agent ID / Agency Name","id","text","e.g. BlueCloud Staffing or ADMIN"],["Password","pass","password","••••••••"]].map(([label,key,type,ph])=>(
+                  <div key={key} style={{ marginBottom:16 }}>
+                    <label style={{ display:"block", fontSize:10, fontWeight:700, letterSpacing:"0.08em", textTransform:"uppercase", color:"#4a6680", marginBottom:6 }}>{label}</label>
+                    <input type={type} value={loginInput[key]} placeholder={ph}
+                      onChange={e=>setLoginInput(p=>({...p,[key]:e.target.value}))}
+                      onKeyDown={e=>e.key==="Enter"&&handleLogin()}
+                      style={{ width:"100%", background:"#0a1520", border:"1px solid #1e3a55", borderRadius:8, padding:"11px 14px", color:"#cce4ff", fontSize:14, outline:"none", boxSizing:"border-box" }} />
+                  </div>
+                ))}
+                {loginError && <div style={{ color:"#e06060", fontSize:12, marginBottom:14, background:"#2a0a0a", padding:"10px 14px", borderRadius:6, border:"1px solid #e0606040" }}>⚠ {loginError}</div>}
+                <button onClick={handleLogin} style={{ width:"100%", background:"linear-gradient(135deg,#1e6aaa,#0e4488)", color:"#cce4ff", border:"none", borderRadius:8, padding:"13px", fontSize:14, fontWeight:700, letterSpacing:"0.08em", textTransform:"uppercase", cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", marginBottom:20 }}>Sign In →</button>
+                <div style={{ background:"#0a1520", border:"1px solid #1a3050", borderRadius:8, padding:14 }}>
+                  <div style={{ fontSize:10, color:"#4a6680", fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:8 }}>Demo Credentials</div>
+                  <div style={{ fontSize:12, color:"#4a8fb8", marginBottom:4 }}>Admin: <strong style={{color:"#cce4ff"}}>ADMIN</strong> / <strong style={{color:"#cce4ff"}}>uss2026!</strong></div>
+                  <div style={{ fontSize:12, color:"#4a8fb8" }}>Agent: use agency name / <strong style={{color:"#cce4ff"}}>staffing123</strong></div>
+                  <div style={{ fontSize:10, color:"#4a6680", marginTop:6 }}>Upload data first to enable agent logins</div>
+                </div>
+              </div>
+              <div style={{ textAlign:"center", marginTop:18, fontSize:11, color:"#1e3a55" }}>© USA Staffing Services · 3502 Henderson Blvd, Tampa, FL · (877) 312-8964</div>
+            </div>
+          </div>
+        );
+      }
+
+      /* ── DASHBOARD ── */
+      return (
+        <div style={{ minHeight:"100vh", background:"#060e18", color:"#cce4ff", fontFamily:"'Barlow',sans-serif" }}>
+          <div style={{ position:"fixed", inset:0, backgroundImage:"linear-gradient(#1a3a5508 1px,transparent 1px),linear-gradient(90deg,#1a3a5508 1px,transparent 1px)", backgroundSize:"40px 40px", pointerEvents:"none" }} />
+
+          <header style={{ position:"sticky", top:0, zIndex:100, background:"#0a1520ee", backdropFilter:"blur(12px)", borderBottom:"1px solid #1a3050", padding:"0 24px" }}>
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", height:56 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+                <img src="https://www.usastaffingservices.com/wp-content/uploads/2022/11/USA-Staffing-Services.png"
+                  alt="USS" style={{ height:26, filter:"brightness(0) invert(1)", objectFit:"contain" }}
+                  onError={e=>{e.target.style.display="none";}} />
+                <div style={{ width:1, height:16, background:"#1e3a55" }} />
+                <span style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:14, fontWeight:800, color:"#cce4ff" }}>{currentAgent||"Admin Dashboard"}</span>
+              </div>
+              <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                {allWeeks.length>0 && (
+                  <select value={displayWeek||""} onChange={e=>setSelectedWeek(e.target.value)}
+                    style={{ background:"#0a1520", border:"1px solid #1e3a55", color:"#cce4ff", borderRadius:6, padding:"5px 10px", fontSize:12, outline:"none", cursor:"pointer" }}>
+                    {allWeeks.slice().reverse().map(w=><option key={w} value={w}>{weekLabel(w)}{w===latestWeek?" (latest)":""}</option>)}
+                  </select>
+                )}
+                {!currentAgent && allAgentNames.length>0 && (
+                  <select value={agentFilter||""} onChange={e=>setAgentFilter(e.target.value||null)}
+                    style={{ background:"#0a1520", border:"1px solid #1e3a55", color:"#cce4ff", borderRadius:6, padding:"5px 10px", fontSize:12, outline:"none", cursor:"pointer", maxWidth:180 }}>
+                    <option value="">All Agents</option>
+                    {allAgentNames.map(n=><option key={n} value={n}>{n}</option>)}
+                  </select>
+                )}
+                <button onClick={()=>{setLoggedIn(false);setCurrentAgent(null);setActiveTab("overview");}}
+                  style={{ background:"#0a1a2a", border:"1px solid #1e3a55", color:"#4a8fb8", borderRadius:6, padding:"5px 12px", fontSize:11, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", textTransform:"uppercase", letterSpacing:"0.06em" }}>Sign Out</button>
+              </div>
+            </div>
+            <div style={{ display:"flex", gap:2, overflowX:"auto" }}>
+              {tabs.map(([id,label])=>(
+                <button key={id} onClick={()=>setActiveTab(id)} style={{ background:"none", border:"none", borderBottom:activeTab===id?"2px solid #4a8fb8":"2px solid transparent", color:activeTab===id?"#cce4ff":"#4a6680", padding:"8px 16px", fontSize:12, fontWeight:700, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", letterSpacing:"0.06em", textTransform:"uppercase", whiteSpace:"nowrap" }}>
+                  {label}{id==="upload"?" +":""}
+                </button>
+              ))}
+            </div>
+          </header>
+
+          <main style={{ padding:24, maxWidth:1400, margin:"0 auto" }}>
+
+            {allUploads.length===0 && !["upload","invoices","manage"].includes(activeTab) && (
+              <div style={{ textAlign:"center", padding:"80px 0" }}>
+                <div style={{ fontSize:48, marginBottom:16 }}>📊</div>
+                <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:22, color:"#8ab0cc", marginBottom:8 }}>No data loaded yet</div>
+                <div style={{ color:"#4a6680", fontSize:13, marginBottom:24 }}>Upload your first BullhornONE weekly report to get started</div>
+                <button onClick={()=>setActiveTab("upload")} style={{ background:"linear-gradient(135deg,#1e6aaa,#0e4488)", color:"#cce4ff", border:"none", borderRadius:8, padding:"12px 28px", fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"'Barlow Condensed',sans-serif", letterSpacing:"0.08em", textTransform:"uppercase" }}>Upload Weekly Report →</button>
+              </div>
+            )}
+
+            {/* OVERVIEW */}
+            {activeTab==="overview" && allUploads.length>0 && (
+              <>
+                <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:22 }}>
+                  <StatCard label="Active Workers"   value={kpi.workers}               sub={weekLabel(displayWeek)}                                                    accent="#4a8fb8" icon="👷" />
+                  <StatCard label="Gross Revenue"    value={fmt(kpi.revenue)}          sub="Total billed to clients"                                                    accent="#60c8f8" icon="📈" />
+                  <StatCard label="Gross Payroll"    value={fmt(kpi.payroll)}          sub="Total wages + burden"                                                       accent="#f0c060" icon="💰" />
+                  <StatCard label="Agent Profit"     value={fmt(kpi.profit)}           sub={kpi.revenue>0?`${((kpi.profit/kpi.revenue)*100).toFixed(1)}% margin`:""}   accent="#40e090" icon="⭐" />
+                  <StatCard label="Customers"        value={kpi.customers}             sub="End-user clients"                                                           accent="#a060e8" icon="🏢" />
+                  <StatCard label="Total Hours"      value={kpi.totalHours.toFixed(1)} sub="Reg + OT billed"                                                           accent="#e06888" icon="⏱" />
+                  <StatCard label="Pending Profit"   value={fmt(profitSummary.pendingProfit)} sub={`${profitSummary.unpaidCount+profitSummary.partialCount} open invoices`} accent="#f0c060" icon="⏳" />
+                  <StatCard label="Paid Profit"      value={fmt(profitSummary.paidProfit)}    sub={`${profitSummary.paidCount} paid invoices`}                         accent="#40e090" icon="✅" />
+                </div>
+
+                <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:22, marginBottom:18 }}>
+                  <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:15, fontWeight:700, color:"#cce4ff", marginBottom:4 }}>Profit Per Worker — {weekLabel(displayWeek)}</div>
+                  <div style={{ fontSize:11, color:"#4a6680", marginBottom:16 }}>Agent profit generated from each temporary worker this week</div>
+                  <div style={{ display:"flex", flexDirection:"column", gap:7 }}>
+                    {displayRecords.slice().sort((a,b)=>b.agentProfit-a.agentProfit).map((r,i)=>{
+                      const pct = kpi.profit>0?(r.agentProfit/kpi.profit)*100:0;
+                      return (
+                        <div key={i} style={{ display:"flex", alignItems:"center", gap:10 }}>
+                          <div style={{ width:150, fontSize:11, color:"#cce4ff", fontWeight:600, flexShrink:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{r.candidate||r.candidateName}</div>
+                          <div style={{ width:130, fontSize:10, color:"#4a8fb8", flexShrink:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{r.customer}</div>
+                          <div style={{ flex:1, background:"#0a1520", borderRadius:3, height:7 }}>
+                            <div style={{ height:"100%", width:`${Math.max(pct,0.5)}%`, background:r.agentProfit>=0?"linear-gradient(90deg,#1e6aaa,#40e090)":"#e06060", borderRadius:3 }} />
+                          </div>
+                          <div style={{ width:80, textAlign:"right", fontSize:12, fontWeight:700, color:r.agentProfit>=0?"#40e090":"#e06060", flexShrink:0 }}>{fmt(r.agentProfit)}</div>
+                          <div style={{ width:48, textAlign:"right", fontSize:10, color:"#4a6680", flexShrink:0 }}>{th(r).toFixed(1)}h</div>
+                        </div>
+                      );
+                    })}
+                    <div style={{ borderTop:"1px solid #1a3050", paddingTop:10, marginTop:4, display:"flex", justifyContent:"flex-end", gap:22 }}>
+                      <span style={{ fontSize:11, color:"#4a6680" }}>Revenue: <span style={{color:"#60c8f8"}}>{fmt(kpi.revenue)}</span></span>
+                      <span style={{ fontSize:11, color:"#4a6680" }}>Payroll: <span style={{color:"#f0c060"}}>{fmt(kpi.payroll)}</span></span>
+                      <span style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:15, fontWeight:800, color:"#40e090" }}>Total Profit: {fmt(kpi.profit)}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {historicalData.length>1 && (
+                  <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:22 }}>
+                    <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:15, fontWeight:700, color:"#cce4ff", marginBottom:14 }}>Historical Trend</div>
+                    <ResponsiveContainer width="100%" height={200}>
+                      <AreaChart data={historicalData}>
+                        <defs>
+                          <linearGradient id="revG" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#4a8fb8" stopOpacity={0.3}/><stop offset="95%" stopColor="#4a8fb8" stopOpacity={0}/></linearGradient>
+                          <linearGradient id="profG" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#40e090" stopOpacity={0.3}/><stop offset="95%" stopColor="#40e090" stopOpacity={0}/></linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#1a2d40" />
+                        <XAxis dataKey="period" tick={{fill:"#4a6680",fontSize:10}} axisLine={false} tickLine={false} />
+                        <YAxis tick={{fill:"#4a6680",fontSize:10}} axisLine={false} tickLine={false} tickFormatter={fmtK} />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Area type="monotone" dataKey="revenue" stroke="#4a8fb8" fill="url(#revG)" strokeWidth={2} name="Revenue" />
+                        <Area type="monotone" dataKey="profit"  stroke="#40e090" fill="url(#profG)" strokeWidth={2} name="Profit" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* PAYMENTS (agent view) */}
+            {activeTab==="payments" && (
+              <div>
+                <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:20 }}>
+                  <StatCard label="⏳ Pending Profit" value={fmt(profitSummary.pendingProfit)} sub={`${profitSummary.unpaidCount+profitSummary.partialCount} open invoices`} accent="#f0c060" icon="" />
+                  <StatCard label="✅ Paid Profit"    value={fmt(profitSummary.paidProfit)}    sub={`${profitSummary.paidCount} paid invoices`}                          accent="#40e090" icon="" />
+                  <StatCard label="Total Invoiced"    value={fmt(agentInvoices.reduce((s,i)=>s+i.invoiceAmount,0))} sub={`${agentInvoices.length} invoices`}             accent="#4a8fb8" icon="🧾" />
+                </div>
+                {agentInvoices.length===0 ? (
+                  <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:"48px 24px", textAlign:"center" }}>
+                    <div style={{ fontSize:32, marginBottom:10 }}>🧾</div>
+                    <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:18, color:"#cce4ff", marginBottom:6 }}>No invoices yet</div>
+                    <div style={{ fontSize:13, color:"#4a6680" }}>Your invoices will appear here once the Admin uploads the invoice report.</div>
+                  </div>
+                ) : (
+                  <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, overflowX:"auto" }}>
+                    <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12, minWidth:640 }}>
+                      <thead>
+                        <tr style={{ background:"#0a1520" }}>
+                          {["Invoice #","Customer","Invoice Date","Statement Date","Amount","Paid","Balance","Linked Profit","Status"].map(h=>(
+                            <th key={h} style={{ padding:"9px 12px", textAlign:"left", color:"#4a8fb8", fontFamily:"'Barlow Condensed',sans-serif", fontSize:10, letterSpacing:"0.06em", textTransform:"uppercase", borderBottom:"1px solid #1a2d40", whiteSpace:"nowrap" }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {agentInvoices.map((inv,i)=>(
+                          <tr key={i} style={{ background:i%2===0?"#0d1e2e":"#0f2133", borderBottom:"1px solid #142030" }}>
+                            <td style={{ padding:"9px 12px", fontWeight:700, color:"#cce4ff" }}>#{inv.invoiceNum}</td>
+                            <td style={{ padding:"9px 12px", color:"#8ab0cc" }}>{inv.customer}</td>
+                            <td style={{ padding:"9px 12px", color:"#6890a8", whiteSpace:"nowrap" }}>{inv.invoiceDate||"—"}</td>
+                            <td style={{ padding:"9px 12px", color:"#6890a8", whiteSpace:"nowrap" }}>{inv.statementDate||"—"}</td>
+                            <td style={{ padding:"9px 12px", color:"#60c8f8", fontWeight:600 }}>{fmt(inv.invoiceAmount)}</td>
+                            <td style={{ padding:"9px 12px", color:"#40e090", fontWeight:600 }}>{fmt(inv.paidAmount)}</td>
+                            <td style={{ padding:"9px 12px", color:inv.balanceDue>0?"#e06060":"#40e090", fontWeight:700 }}>{fmt(inv.balanceDue)}</td>
+                            <td style={{ padding:"9px 12px", fontWeight:700, color:inv.status==="Paid"?"#40e090":"#f0c060" }}>{fmt(inv.linkedProfit)}</td>
+                            <td style={{ padding:"9px 12px" }}>
+                              <span style={{ background:inv.status==="Paid"?"#0a2a1a":inv.status==="Partial"?"#2a1a00":"#2a0a0a", color:inv.status==="Paid"?"#40e090":inv.status==="Partial"?"#f0c060":"#e06060", border:`1px solid ${inv.status==="Paid"?"#40e09040":inv.status==="Partial"?"#f0c06040":"#e0606040"}`, borderRadius:20, padding:"2px 9px", fontSize:10, fontWeight:700 }}>{inv.status}</span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* WORKERS */}
+            {activeTab==="workers" && allUploads.length>0 && (
+              <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:22 }}>
+                <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:18, fontWeight:700, color:"#cce4ff", marginBottom:4 }}>Temporary Workers on Assignment</div>
+                <div style={{ fontSize:11, color:"#4a6680", marginBottom:16 }}>{displayRecords.length} workers · {weekLabel(displayWeek)}</div>
+                <WorkerTable records={displayRecords} />
+              </div>
+            )}
+
+            {/* CUSTOMERS */}
+            {activeTab==="customers" && allUploads.length>0 && (
+              <div>
+                <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:18, fontWeight:700, color:"#cce4ff", marginBottom:18 }}>End-User Customers — {weekLabel(displayWeek)}</div>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:14 }}>
+                  {customerBreakdown.map(c=>(
+                    <div key={c.customer} style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:18, minWidth:250, flex:"1 1 250px" }}>
+                      <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:14, fontWeight:700, color:"#60c8f8", marginBottom:10 }}>{c.customer}</div>
+                      <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+                        {[["Workers",c.workers.length,"#cce4ff"],["Revenue",fmt(c.revenue),"#60c8f8"],["Payroll",fmt(c.payroll),"#f0c060"],["Burden",fmt(c.burden),"#e09040"],["Profit",fmt(c.profit),"#40e090"]].map(([l,v,col])=>(
+                          <div key={l} style={{ display:"flex", justifyContent:"space-between", fontSize:12 }}>
+                            <span style={{color:"#4a6680"}}>{l}</span><span style={{color:col,fontWeight:600}}>{v}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{ marginTop:10, borderTop:"1px solid #1a3050", paddingTop:8 }}>
+                        {c.workers.map((w,i)=>(
+                          <div key={i} style={{ fontSize:10, color:"#6890a8", paddingBottom:2 }}>· {w.candidate||w.candidateName} — {th(w).toFixed(1)}h · {fmt(w.agentProfit)}</div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ANALYTICS */}
+            {activeTab==="analytics" && allUploads.length>0 && (
+              <>
+                <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:22, marginBottom:16 }}>
+                  <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:15, fontWeight:700, color:"#cce4ff", marginBottom:16 }}>Weekly Revenue vs. Payroll vs. Profit</div>
+                  <ResponsiveContainer width="100%" height={250}>
+                    <BarChart data={historicalData} barGap={3}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1a2d40" />
+                      <XAxis dataKey="period" tick={{fill:"#4a6680",fontSize:10}} axisLine={false} tickLine={false} />
+                      <YAxis tick={{fill:"#4a6680",fontSize:10}} axisLine={false} tickLine={false} tickFormatter={fmtK} />
+                      <Tooltip content={<CustomTooltip />} />
+                      <Legend wrapperStyle={{fontSize:11,color:"#8ab0cc"}} />
+                      <Bar dataKey="revenue" name="Revenue" fill="#1e5a8a" radius={[3,3,0,0]} />
+                      <Bar dataKey="payroll" name="Payroll" fill="#0e3058" radius={[3,3,0,0]} />
+                      <Bar dataKey="profit"  name="Profit"  fill="#20a060" radius={[3,3,0,0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+                <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:22, marginBottom:16 }}>
+                  <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:15, fontWeight:700, color:"#cce4ff", marginBottom:16 }}>Top Worker Profit — {weekLabel(displayWeek)}</div>
+                  <ResponsiveContainer width="100%" height={230}>
+                    <BarChart data={workerProfitData} layout="vertical">
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1a2d40" horizontal={false} />
+                      <XAxis type="number" tick={{fill:"#4a6680",fontSize:10}} axisLine={false} tickLine={false} tickFormatter={v=>"$"+v.toFixed(0)} />
+                      <YAxis type="category" dataKey="name" tick={{fill:"#8ab0cc",fontSize:10}} axisLine={false} tickLine={false} width={120} />
+                      <Tooltip content={<CustomTooltip />} />
+                      <Bar dataKey="profit" name="Profit" fill="#1e6aaa" radius={[0,4,4,0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+                <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:22 }}>
+                  <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:15, fontWeight:700, color:"#cce4ff", marginBottom:14 }}>Weekly Summary</div>
+                  <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+                    <thead>
+                      <tr style={{ background:"#0a1520" }}>
+                        {["Week Ending","Workers","Revenue","Payroll","Profit","Margin"].map(h=>(
+                          <th key={h} style={{ padding:"9px 12px", textAlign:"left", color:"#4a8fb8", fontFamily:"'Barlow Condensed',sans-serif", fontSize:10, letterSpacing:"0.07em", textTransform:"uppercase", borderBottom:"1px solid #1a2d40" }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {historicalData.slice().reverse().map((row,i)=>(
+                        <tr key={i} style={{ background:i%2===0?"#0d1e2e":"#0f2133", borderBottom:"1px solid #142030" }}>
+                          <td style={{ padding:"9px 12px", color:"#8ab0cc" }}>{row.period}</td>
+                          <td style={{ padding:"9px 12px", color:"#cce4ff" }}>{row.workers}</td>
+                          <td style={{ padding:"9px 12px", color:"#60c8f8" }}>{fmt(row.revenue)}</td>
+                          <td style={{ padding:"9px 12px", color:"#f0c060" }}>{fmt(row.payroll)}</td>
+                          <td style={{ padding:"9px 12px", color:"#40e090", fontWeight:700 }}>{fmt(row.profit)}</td>
+                          <td style={{ padding:"9px 12px", color:"#cce4ff" }}>{row.revenue>0?((row.profit/row.revenue)*100).toFixed(1)+"%":"—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+
+            {/* AGENT SUMMARY (admin) */}
+            {activeTab==="agents" && allUploads.length>0 && (
+              <div>
+                <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:18, fontWeight:700, color:"#cce4ff", marginBottom:4 }}>Summary by Staffing Agent — {weekLabel(displayWeek)}</div>
+                <div style={{ fontSize:12, color:"#4a6680", marginBottom:20 }}>{agentSummary.length} agents · sorted by profit</div>
+
+                {/* Top-level stat row */}
+                <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:22 }}>
+                  {[
+                    ["👷 Total Workers", currentWeekRecords.length, "#4a8fb8"],
+                    ["📈 Gross Revenue", fmt(currentWeekRecords.reduce((s,r)=>s+r.grossSales,0)), "#60c8f8"],
+                    ["💰 Gross Payroll", fmt(currentWeekRecords.reduce((s,r)=>s+r.grossWages,0)), "#f0c060"],
+                    ["🔩 Total Burden", fmt(currentWeekRecords.reduce((s,r)=>s+(r.burdenAmt||0),0)), "#e09040"],
+                    ["⭐ Total Profit", fmt(currentWeekRecords.reduce((s,r)=>s+r.agentProfit,0)), "#40e090"],
+                  ].map(([label,value,accent])=>(
+                    <div key={label} style={{ background:"#0f1923", border:`1px solid ${accent}33`, borderTop:`3px solid ${accent}`, borderRadius:8, padding:"14px 18px", flex:1, minWidth:130 }}>
+                      <div style={{ fontSize:9, fontFamily:"'Barlow Condensed',sans-serif", letterSpacing:"0.12em", textTransform:"uppercase", color:"#7a8fa6", marginBottom:4 }}>{label}</div>
+                      <div style={{ fontSize:22, fontWeight:800, fontFamily:"'Barlow Condensed',sans-serif", color:accent }}>{value}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Per-agent cards */}
+                <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+                  {agentSummary.map((agent, idx) => {
+                    const totalProfit = currentWeekRecords.reduce((s,r)=>s+r.agentProfit,0);
+                    const pct = totalProfit > 0 ? (agent.profit / totalProfit) * 100 : 0;
+                    const margin = agent.revenue > 0 ? (agent.profit / agent.revenue) * 100 : 0;
+                    return (
+                      <div key={agent.branch} style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:20 }}>
+                        {/* Agent header */}
+                        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:14, flexWrap:"wrap", gap:8 }}>
+                          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                            <div style={{ background:"#1e3a55", borderRadius:"50%", width:32, height:32, display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"'Barlow Condensed',sans-serif", fontWeight:800, fontSize:14, color:"#60c8f8", flexShrink:0 }}>
+                              {agent.branch.charAt(0).toUpperCase()}
+                            </div>
+                            <div>
+                              <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:16, fontWeight:800, color:"#cce4ff" }}>{agent.branch}</div>
+                              <div style={{ fontSize:10, color:"#4a6680", marginTop:1 }}>{agent.workerCount} worker{agent.workerCount!==1?"s":""} · {agent.customerCount} customer{agent.customerCount!==1?"s":""} · {agent.hours.toFixed(1)}h billed</div>
+                            </div>
+                          </div>
+                          <div style={{ textAlign:"right" }}>
+                            <div style={{ fontFamily:"'Barlow Condensed',sans-serif", fontSize:22, fontWeight:800, color:"#40e090" }}>{fmt(agent.profit)}</div>
+                            <div style={{ fontSize:10, color:"#4a6680" }}>{margin.toFixed(1)}% margin · {pct.toFixed(1)}% of total</div>
+                          </div>
+                        </div>
+
+                        {/* Profit share bar */}
+                        <div style={{ background:"#0a1520", borderRadius:4, height:6, marginBottom:14 }}>
+                          <div style={{ height:"100%", width:`${Math.max(pct,0.3)}%`, background:"linear-gradient(90deg,#1e6aaa,#40e090)", borderRadius:4 }} />
+                        </div>
+
+                        {/* Stats row */}
+                        <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:14 }}>
+                          {[
+                            ["Gross Revenue", fmt(agent.revenue), "#60c8f8"],
+                            ["Gross Payroll", fmt(agent.payroll), "#f0c060"],
+                            ["Burden $",      fmt(agent.burden),  "#e09040"],
+                            ["Agent Profit",  fmt(agent.profit),  "#40e090"],
+                          ].map(([label, value, color])=>(
+                            <div key={label} style={{ background:"#0a1520", borderRadius:7, padding:"10px 14px", flex:1, minWidth:110 }}>
+                              <div style={{ fontSize:9, fontFamily:"'Barlow Condensed',sans-serif", letterSpacing:"0.1em", textTransform:"uppercase", color:"#4a6680", marginBottom:3 }}>{label}</div>
+                              <div style={{ fontSize:16, fontWeight:800, fontFamily:"'Barlow Condensed',sans-serif", color }}>{value}</div>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* Per-worker bars */}
+                        <div style={{ borderTop:"1px solid #1a3050", paddingTop:12 }}>
+                          <div style={{ fontSize:10, color:"#4a6680", fontWeight:700, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:8 }}>Workers</div>
+                          <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+                            {agent.records.slice().sort((a,b)=>b.agentProfit-a.agentProfit).map((r,i)=>{
+                              const wp = agent.profit > 0 ? (r.agentProfit / agent.profit) * 100 : 0;
+                              return (
+                                <div key={i} style={{ display:"flex", alignItems:"center", gap:8 }}>
+                                  <div style={{ width:140, fontSize:11, color:"#cce4ff", flexShrink:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{r.candidate||r.candidateName}</div>
+                                  <div style={{ width:120, fontSize:10, color:"#4a8fb8", flexShrink:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{r.customer}</div>
+                                  <div style={{ flex:1, background:"#060e18", borderRadius:3, height:5 }}>
+                                    <div style={{ height:"100%", width:`${Math.max(wp,0.5)}%`, background:r.agentProfit>=0?"linear-gradient(90deg,#1e5a88,#40e090)":"#e06060", borderRadius:3 }} />
+                                  </div>
+                                  <div style={{ width:76, textAlign:"right", fontSize:11, fontWeight:700, color:r.agentProfit>=0?"#40e090":"#e06060", flexShrink:0 }}>{fmt(r.agentProfit)}</div>
+                                  <div style={{ width:44, textAlign:"right", fontSize:10, color:"#4a6680", flexShrink:0 }}>{th(r).toFixed(1)}h</div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* INVOICES (admin) */}
+            {activeTab==="invoices" && (
+              <InvoiceTab invoices={enrichedInvoices} allAgentNames={allAgentNames} onUpload={handleInvoiceUpload} onOverride={handleInvoiceOverride} />
+            )}
+
+            {/* AGENT MANAGEMENT (admin) */}
+            {activeTab==="manage" && (
+              <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10, padding:22 }}>
+                <AgentManagement allAgentNames={allAgentNames} agentProfiles={agentProfiles} onSave={handleSaveAgent} />
+              </div>
+            )}
+
+            {/* UPLOAD (admin) */}
+            {activeTab==="upload" && (
+              <div style={{ background:"#0d1e2e", border:"1px solid #1a3050", borderRadius:10 }}>
+                <UploadPanel onUpload={handleUpload} onDelete={handleDelete} uploadHistory={uploadHistory} />
+              </div>
+            )}
+
+          </main>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<StaffingDashboard />);
+  </script>
+</body>
+</html>
